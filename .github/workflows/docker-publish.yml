@@ -2,24 +2,90 @@ apiVersion: argoproj.io/v1alpha1
 kind: WorkflowTemplate
 metadata:
   name: external-llm-workflow
+  annotations:
+    scenarios.ai.sap.com/name: "external-llm"
+    scenarios.ai.sap.com/description: "Call an external LLM (OpenRouter) and return sustainability-only answer"
+    executables.ai.sap.com/name: "external-llm"
+    executables.ai.sap.com/description: "Run one-off LLM call"
 spec:
-  entrypoint: main
+  entrypoint: run
+  arguments:
+    parameters:
+      - name: question
+        value: "What are Scope 3 emissions?"
+      - name: system_prompt
+        value: "You are a helpful assistant focused on sustainability. If the user asks anything unrelated to sustainability/environmental topics, reply exactly: 'Please ask questions about sustainability.' Keep answers short."
+      - name: model
+        value: "openrouter/anthropic/claude-3.5-sonnet"
   templates:
-    - name: main
-      steps:
-        - - name: call-external-llm
-            template: external-llm
-
-    - name: external-llm
+    - name: run
       inputs:
         parameters:
-          - name: prompt
+          - name: question
+          - name: system_prompt
+          - name: model
       container:
-        image: iomaiph/external-llm:latest
-        command: [python, /app/main.py]
+        image: python:3.11-slim
+        imagePullPolicy: Always
+        command: ["bash","-lc"]
+        args:
+          - |
+            pip install --no-cache-dir requests >/dev/null 2>&1
+            python - <<'PY'
+            import os, json, requests, sys
+
+            question = os.environ["QUESTION"]
+            system_prompt = os.environ["SYSTEM_PROMPT"]
+            model = os.environ["MODEL"]
+
+            # We accept either OPENROUTER_API_KEY or API_KEY to be set via secret
+            api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("API_KEY")
+            if not api_key:
+                print("ERROR: No API key provided. Create secret 'external-llm-secret' with key OPENROUTER_API_KEY.", file=sys.stderr)
+                sys.exit(1)
+
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+              "Authorization": f"Bearer {api_key}",
+              "Content-Type": "application/json",
+              "HTTP-Referer": "https://example.com",
+              "X-Title": "SAP AI Core External LLM Demo"
+            }
+            payload = {
+              "model": model,
+              "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question}
+              ],
+              "max_tokens": 400,
+            }
+            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=90)
+            print("STATUS:", r.status_code)
+            try:
+                data = r.json()
+                # OpenRouter response shape (OpenAI-like)
+                content = data["choices"][0]["message"]["content"]
+                print("RESPONSE:", content)
+            except Exception:
+                print("RAW:", r.text)
+            PY
         env:
-          - name: EXTERNAL_LLM_API_KEY
+          - name: QUESTION
+            value: "{{inputs.parameters.question}}"
+          - name: SYSTEM_PROMPT
+            value: "{{inputs.parameters.system_prompt}}"
+          - name: MODEL
+            value: "{{inputs.parameters.model}}"
+          # pull key from SAP AI Core secret
+          - name: OPENROUTER_API_KEY
             valueFrom:
               secretKeyRef:
                 name: external-llm-secret
-                key: api-key
+                key: OPENROUTER_API_KEY
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
